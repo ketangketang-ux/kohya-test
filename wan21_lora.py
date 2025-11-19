@@ -1,7 +1,8 @@
 # ============================================
-# backend_wan21_lora.py
-# WAN 2.1 LoRA Prototype + Auto Caption + PNG Preview
-# Modal-friendly backend (NO Modal SDK import in Colab)
+# backend_wan21_lora.py (FINAL, base64 FIX)
+# WAN 2.1 Diffusers LoRA prototype + PNG Preview
+# Auto-caption (Qwen-VL), trigger token: lingga
+# Designed for Modal CLI (NO import modal in Colab)
 # ============================================
 
 import modal
@@ -11,11 +12,6 @@ import torch
 
 from transformers import AutoTokenizer, AutoModelForVision2Seq
 from diffusers import DiffusionPipeline, UniPCMultistepScheduler
-from accelerate import Accelerator
-
-# ============================================
-# Modal App + Requirements
-# ============================================
 
 app = modal.App("wan21_lora_app")
 
@@ -29,18 +25,16 @@ image = (
         "peft",
         "bitsandbytes",
         "safetensors",
-        "Pillow"
+        "Pillow",
     )
 )
 
-# ============================================
-# Auto Caption - Qwen-VL
-# ============================================
-
+# ---------------------------------------------------
+# AUTO CAPTION (Qwen-VL)
+# ---------------------------------------------------
 def auto_caption(image_bytes):
     try:
         image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-
         model_id = "Qwen/Qwen2-VL-2B-Instruct"
 
         tokenizer = AutoTokenizer.from_pretrained(
@@ -52,35 +46,36 @@ def auto_caption(image_bytes):
             trust_remote_code=True
         ).eval()
 
-        caption = model.chat(
+        out = model.chat(
             tokenizer,
             query="Deskripsikan gambar ini secara singkat.",
             image=image
         )
 
-        return caption.strip()
+        return out.strip()
 
     except Exception as e:
-        print("Caption error:", e)
+        print("Caption Error:", e)
         return "foto tanpa caption"
 
-# ============================================
-# Simple UNet LoRA Adapter (Prototype)
-# ============================================
 
-def inject_lora(unet, rank=4, alpha=32):
+# ---------------------------------------------------
+# Inject simple LoRA adapter (Prototype)
+# ---------------------------------------------------
+def inject_lora(unet, rank=8, alpha=32):
+
     for name, module in unet.named_modules():
         for attr in ["to_q", "to_k", "to_v", "to_out"]:
             if hasattr(module, attr):
-                orig = getattr(module, attr)
-                if not hasattr(orig, "weight"):
+                linear = getattr(module, attr)
+                if not hasattr(linear, "weight"):
                     continue
 
-                in_dim = orig.weight.shape[1]
-                out_dim = orig.weight.shape[0]
+                in_dim = linear.weight.shape[1]
+                out_dim = linear.weight.shape[0]
 
-                A = torch.nn.Parameter(torch.randn((rank, in_dim)) * 0.01)
-                B = torch.nn.Parameter(torch.randn((out_dim, rank)) * 0.01)
+                A = torch.nn.Parameter(torch.randn(rank, in_dim) * 0.01)
+                B = torch.nn.Parameter(torch.randn(out_dim, rank) * 0.01)
 
                 module.register_parameter(f"{attr}_lora_A", A)
                 module.register_parameter(f"{attr}_lora_B", B)
@@ -90,147 +85,143 @@ def inject_lora(unet, rank=4, alpha=32):
     return unet
 
 
-def lora_forward(orig_weight, x, A, B):
-    lora = (B @ (A @ x.t())).t()
-    return orig_weight(x) + lora
-
-
-# ============================================
-# Preview Helper
-# ============================================
-
-def generate_preview(pipe, prompt, out_file, height, width, steps, generator):
+# ---------------------------------------------------
+# Preview
+# ---------------------------------------------------
+def generate_preview(pipe, prompt, outfile, H, W, steps, generator):
     image = pipe(
         prompt,
+        height=H,
+        width=W,
         num_inference_steps=steps,
-        height=height,
-        width=width,
         generator=generator
     ).images[0]
 
-    image.save(out_file)
+    image.save(outfile)
 
-    with open(out_file, "rb") as f:
-        raw = f.read()
-
-    return base64.b64encode(raw).decode("utf-8")
+    b = open(outfile, "rb").read()
+    return base64.b64encode(b).decode("utf-8")
 
 
-# ============================================
-# MAIN TRAIN FUNCTION
-# ============================================
+# ---------------------------------------------------
+# TRAIN FUNCTION
+# ---------------------------------------------------
 
 @app.function(image=image, gpu="A10G", timeout=86400)
 def train_wan2_lora(config: dict, dataset_payload: list):
-    # --- CONFIG ---
-    wan_model = config.get("wan_model_id", "tencent-ailab/Wan2.1-diffusers")
-    epochs = int(config.get("epochs", 1))
-    lr = float(config.get("lr", 1e-4))
-    micro_batch = int(config.get("micro_batch", 1))
-    preview_interval = int(config.get("preview_interval", 50))
-    preview_steps = int(config.get("preview_steps", 20))
-    H = int(config.get("preview_height", 512))
-    W = int(config.get("preview_width", 512))
-    rank = int(config.get("lora_rank", 8))
-    alpha = int(config.get("lora_alpha", 32))
-    seed = int(config.get("seed", 42))
 
-    g = torch.Generator("cuda").manual_seed(seed)
+    wan_model = config.get("wan_model_id", "tencent-ailab/Wan2.1-diffusers")
+    epochs = config.get("epochs", 1)
+    lr = config.get("lr", 1e-4)
+    micro_batch = config.get("micro_batch", 1)
+    preview_interval = config.get("preview_interval", 50)
+    preview_steps = config.get("preview_steps", 20)
+    H = config.get("preview_height", 512)
+    W = config.get("preview_width", 512)
+    rank = config.get("lora_rank", 8)
+    alpha = config.get("lora_alpha", 32)
+    seed = config.get("seed", 42)
 
     outdir = "/model_out"
     prev_dir = f"{outdir}/previews"
     os.makedirs(prev_dir, exist_ok=True)
 
-    # --- DATASET PROCESSING ---
+    g = torch.Generator(device="cuda").manual_seed(seed)
+
+    # -------------------------------------------
+    # Decode base64 dataset
+    # -------------------------------------------
     texts = []
+
     for item in dataset_payload:
         name = item["name"].lower()
-        b = item["bytes"]
+        raw = base64.b64decode(item["base64"])
 
-        if name.endswith((".jpg", ".png", ".jpeg", ".webp")):
-            cap = auto_caption(b)
+        if name.endswith((".jpg", ".jpeg", ".png", ".webp")):
+            cap = auto_caption(raw)
             texts.append("lingga: " + cap)
 
-        elif name.endswith((".txt", ".jsonl", ".json")):
+        elif name.endswith((".txt", ".json", ".jsonl")):
             try:
-                txt = b.decode("utf-8").strip()
+                txt = raw.decode("utf-8").strip()
                 if txt:
                     texts.append("lingga: " + txt)
             except:
                 pass
 
     if len(texts) == 0:
-        raise RuntimeError("Dataset kosong")
+        raise RuntimeError("Dataset kosong / tidak valid")
 
-    # --- LOAD WAN2.1 PIPELINE ---
-    print("Loading WAN 2.1 pipeline:", wan_model)
+    # -------------------------------------------
+    # Load WAN2.1
+    # -------------------------------------------
+    print("Load WAN2.1:", wan_model)
     pipe = DiffusionPipeline.from_pretrained(
         wan_model,
         torch_dtype=torch.float16
     )
+
     pipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config)
     pipe.to("cuda")
 
     unet = pipe.unet
     unet = inject_lora(unet, rank=rank, alpha=alpha)
 
-    # train only LoRA params
     params = [p for n,p in unet.named_parameters() if "lora" in n]
-    optimizer = torch.optim.AdamW(params, lr=lr)
+    opt = torch.optim.AdamW(params, lr=lr)
 
-    total_steps = epochs * len(texts)
     step = 0
 
-    # --- TRAIN LOOP (prototype) ---
+    # -------------------------------------------
+    # Training loop (Prototype)
+    # -------------------------------------------
     for ep in range(epochs):
         for txt in texts:
-            optimizer.zero_grad()
 
-            # fake tiny loss to allow LoRA update
+            opt.zero_grad()
+
+            # fake minimal loss
             loss = None
             for p in params:
                 v = p.sum()
                 loss = v if loss is None else loss + v
+
             loss = (loss ** 2) * 1e-10
             loss.backward()
-            optimizer.step()
+            opt.step()
 
             step += 1
 
-            # --- PREVIEW ---
+            # PREVIEW
             if step % preview_interval == 0:
-                fpath = f"{prev_dir}/preview_{step}.png"
+                pth = f"{prev_dir}/preview_{step}.png"
                 b64 = generate_preview(
-                    pipe,
-                    txt,
-                    fpath,
-                    H, W,
-                    preview_steps,
-                    g
+                    pipe, txt, pth, H, W, preview_steps, g
                 )
-                print("Saved preview:", fpath)
+                print("Saved Preview:", pth)
 
-    # --- SAVE LORA ---
-    save_dir = f"{outdir}/lora"
-    os.makedirs(save_dir, exist_ok=True)
+    # -------------------------------------------
+    # Save LoRA
+    # -------------------------------------------
+    lora_dir = f"{outdir}/lora"
+    os.makedirs(lora_dir, exist_ok=True)
 
-    lora_dict = {}
-    for n,p in unet.named_parameters():
-        if "lora" in n:
-            lora_dict[n] = p.detach().cpu()
+    state = {n: p.detach().cpu() for n,p in unet.named_parameters() if "lora" in n}
+    torch.save(state, f"{lora_dir}/lora.pt")
 
-    torch.save(lora_dict, f"{save_dir}/lora.pt")
-
-    # --- RETURN PREVIEWS ---
+    # -------------------------------------------
+    # Return previews as base64
+    # -------------------------------------------
     previews = []
     for f in sorted(os.listdir(prev_dir)):
-        path = os.path.join(prev_dir, f)
-        with open(path, "rb") as fp:
-            b64 = base64.b64encode(fp.read()).decode("utf-8")
-        previews.append({"name": f, "base64": b64})
+        b = open(os.path.join(prev_dir, f),"rb").read()
+        previews.append({
+            "name": f,
+            "base64": base64.b64encode(b).decode("utf-8")
+        })
 
     return json.dumps({
         "status": "done",
-        "lora_path": save_dir,
-        "previews": previews
+        "previews": previews,
+        "lora_dir": lora_dir
     })
